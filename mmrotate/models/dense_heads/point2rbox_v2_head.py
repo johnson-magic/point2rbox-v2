@@ -529,8 +529,8 @@ class Point2RBoxV2Head(AnchorFreeHead):
             self, gt_instances: InstanceData, points: Tensor,
             regress_ranges: Tensor,
             num_points_per_lvl: List[int]) -> Tuple[Tensor, Tensor, Tensor]:
-        """Compute regression and classification targets for a single image."""
-        num_points = points.size(0)
+        """Compute regression and classification targets for anchor point in a single image."""
+        num_points = points.size(0) # number of anchor point
         num_gts = len(gt_instances)
         gt_bboxes = gt_instances.bboxes
         gt_labels = gt_instances.labels
@@ -541,22 +541,22 @@ class Point2RBoxV2Head(AnchorFreeHead):
                    gt_bboxes.new_zeros((num_points, 4)), \
                    gt_bids.new_zeros((num_points, 4))
 
-        areas = gt_bboxes.areas
-        gt_bboxes = gt_bboxes.tensor
+        areas = gt_bboxes.areas # magic obj_num,
+        gt_bboxes = gt_bboxes.tensor # magic obj_num * 5
 
         # TODO: figure out why these two are different
         # areas = areas[None].expand(num_points, num_gts)
-        areas = areas[None].repeat(num_points, 1)
+        areas = areas[None].repeat(num_points, 1) # (1, obj_num)--->(num_points, obj_num)
         regress_ranges = regress_ranges[:, None, :].expand(
-            num_points, num_gts, 2)
-        points = points[:, None, :].expand(num_points, num_gts, 2)
-        gt_bboxes = gt_bboxes[None].expand(num_points, num_gts, 5)
+            num_points, num_gts, 2) # (num_points, obj_num, 2)
+        points = points[:, None, :].expand(num_points, num_gts, 2) # (num_points, obj_num, 2)
+        gt_bboxes = gt_bboxes[None].expand(num_points, num_gts, 5) # (num_points, obj_num, 5)
         gt_ctr, gt_wh, gt_angle = torch.split(gt_bboxes, [2, 2, 1], dim=2)
-        
+        # (num_points, obj_num, 2), (num_points, obj_num, 2), (num_points, obj_num, 1)
         offset = points - gt_ctr
-        w, h = gt_wh[..., 0].clone(), gt_wh[..., 1].clone()
+        w, h = gt_wh[..., 0].clone(), gt_wh[..., 1].clone()  # 这里的clone为什么？有梯度？
 
-        center_r = torch.clamp((w * h).sqrt() / 64, 1, 5)[..., None]
+        center_r = torch.clamp((w * h).sqrt() / 64, 1, 5)[..., None] # 没看懂center_r作用？
         offset_x, offset_y = offset[..., 0], offset[..., 1]
         left = w / 2 + offset_x
         right = w / 2 - offset_x
@@ -569,7 +569,7 @@ class Point2RBoxV2Head(AnchorFreeHead):
         if self.center_sampling:
             # condition1: inside a `center bbox`
             radius = self.center_sample_radius
-            stride = offset.new_zeros(offset.shape)
+            stride = offset.new_zeros(offset.shape) # anchor_points_num, obj_num, 2
 
             # project the points on current lvl back to the `original` sizes
             lvl_begin = 0
@@ -602,7 +602,7 @@ class Point2RBoxV2Head(AnchorFreeHead):
         bid_targets = gt_bids[min_area_inds]
         bbox_targets = torch.cat((bbox_targets, angle_targets), -1)
 
-        return labels, bbox_targets, bid_targets
+        return labels, bbox_targets, bid_targets # (anchor_point_num,) (anchor_point_num, 5) (anchor_point_num, 4) 
 
     def predict(self,
                 x: Tuple[Tensor],
@@ -859,11 +859,11 @@ class Point2RBoxV2Head(AnchorFreeHead):
 
             assert cls_score.size()[-2:] == bbox_pred.size()[-2:]
 
-            bbox_pred = bbox_pred.permute(1, 2, 0).reshape(-1, 4)
+            bbox_pred = bbox_pred.permute(1, 2, 0).reshape(-1, 4) # (128*128, 4)
             angle_pred = angle_pred.permute(1, 2, 0).reshape(
-                -1, self.angle_coder.encode_size)
+                -1, self.angle_coder.encode_size) # (128*128, 3)
             cls_score = cls_score.permute(1, 2,
-                                          0).reshape(-1, self.cls_out_channels)
+                                          0).reshape(-1, self.cls_out_channels) # (128*128, 15)
             if self.use_sigmoid_cls:
                 scores = cls_score.sigmoid()
             else:
