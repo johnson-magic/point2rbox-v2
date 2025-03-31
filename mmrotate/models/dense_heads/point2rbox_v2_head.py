@@ -60,7 +60,7 @@ class Point2RBoxV2Head(AnchorFreeHead):
                  num_classes: int,
                  in_channels: int,
                  strides: list = [8, 16, 32],
-                 regress_ranges: list = [(-1, 64), (64, 128), (128, 256)],
+                 regress_ranges: list = [(-1, 1e8), (-1, 1e8), (-1, 1e8)],
                  center_sampling: bool = True,
                  center_sample_radius: float = 0.75,
                  angle_version: str = 'le90',
@@ -320,56 +320,17 @@ class Point2RBoxV2Head(AnchorFreeHead):
             pos_rbox_preds = torch.cat((pos_rbox_targets[:, :2], 
                                         pos_bbox_preds[:, :2] * 2,
                                         pos_decoded_angle_preds), -1)
-
-            # Aggregate targets of the same instance based on their identical bid
-            bid_with_view = pos_bid_targets[:, 3] + 0.5 * pos_bid_targets[:, 2]
-            bid, idx = torch.unique(bid_with_view, return_inverse=True)
             
-            # Generate a mask to eliminate bboxes without correspondence
-            ins_bid_with_view = bid.new_zeros(*bid.shape).index_reduce_(
-                0, idx, bid_with_view, 'amin', include_self=False)
-            _, bidx, bcnt = torch.unique(
-                ins_bid_with_view.long(),
-                return_inverse=True,
-                return_counts=True)
-            bmsk = bcnt[bidx] == 2
-
-            # Select instances by batch
-            ins_bids = pos_bid_targets.new_zeros(*bid.shape).index_reduce_(
-                    0, idx, pos_bid_targets[:, 3], 'amin', include_self=False)
             
-            ins_batch = pos_bid_targets.new_zeros(*bid.shape).index_reduce_(
-                    0, idx, pos_bid_targets[:, 0], 'amin', include_self=False)
-            
-            ins_labels = pos_labels.new_zeros(*bid.shape).index_reduce_(
-                    0, idx, pos_labels, 'amin', include_self=False)
-            
-            ins_gaus_preds = pos_gaus_preds.new_zeros(
-                *bid.shape, 4).index_reduce_(
-                    0, idx, pos_gaus_preds.view(-1, 4), 'mean',
-                    include_self=False).view(-1, 2, 2)
-            
-            ins_rbox_preds = pos_rbox_preds.new_zeros(
-                *bid.shape, pos_rbox_preds.shape[-1]).index_reduce_(
-                    0, idx, pos_rbox_preds, 'mean',
-                    include_self=False)
-            
-            ins_rbox_targets = pos_rbox_targets.new_zeros(
-                *bid.shape, pos_rbox_targets.shape[-1]).index_reduce_(
-                    0, idx, pos_rbox_targets, 'mean',
-                    include_self=False)
-
-            ori_mu_all = ins_rbox_targets[:, 0:2]
-            loss_bbox_ovl = ori_mu_all.new_tensor(0)
-            loss_bbox_vor = ori_mu_all.new_tensor(0)
+            mu_batches = pos_rbox_targets
+            label_batches = pos_labels
+            sigma_batches = pos_gaus_preds
+            loss_bbox_vor_list = []
             for batch_id in range(len(batch_gt_instances)):
-                group_mask = (ins_batch == batch_id) & (ins_bids != 0)
-                # Overlap and Voronoi Losses
-                mu = ori_mu_all[group_mask]
-                sigma = ins_gaus_preds[group_mask]
-                label = ins_labels[group_mask]
-                if len(mu) >= 2:
-                    loss_bbox_ovl += self.loss_overlap((mu, sigma.bmm(sigma)))
+                group_mask = pos_bid_targets[:, 0] == batch_id
+                mu = mu_batches[group_mask]
+                sigma = sigma_batches[group_mask]
+                label = label_batches[group_mask]
                 if len(mu) >= 1:
                     pos_thres = [self.voronoi_thres['default'][0]] * self.num_classes
                     neg_thres = [self.voronoi_thres['default'][1]] * self.num_classes
@@ -378,49 +339,89 @@ class Point2RBoxV2Head(AnchorFreeHead):
                             for cls in item[0]:
                                 pos_thres[cls] = item[1][0]
                                 neg_thres[cls] = item[1][1]
-                    loss_bbox_vor += self.loss_voronoi((mu, sigma.bmm(sigma)),
+                    loss_bbox_vor = self.loss_voronoi((mu, sigma.bmm(sigma)),
                                                        label, self.images[batch_id],
                                                        pos_thres, neg_thres,
-                                                       voronoi=self.voronoi_type)
-                    self.vis[batch_id] = self.loss_voronoi.vis
+                                                       voronoi=self.voronoi_type)  # 每个一position都计算Loss, 但并不是每一个position进行反向传播
+                    loss_bbox_vor_list.append(loss_bbox_vor)
+            
+            loss_bbox_vor_before_sample = torch.cat(loss_bbox_vor_list, dim=-1)
+            bid_with_view = pos_bid_targets[:, 3] + 0.5 * pos_bid_targets[:, 2]
+            unique_bid_with_view, inverse_indices = torch.unique(bid_with_view, return_inverse=True)
+    
+            min_loss_bbox_vor = loss_bbox_vor_before_sample.new_zeros(unique_bid_with_view.shape).index_reduce_(0, loss_bbox_vor_before_sample, A, 'amin', include_self=False)  # 
+    
+            # 生成候选掩码‌:ml-citation{ref="4,7" data="citationList"}
+            fpn_mask_candidate = (loss_bbox_vor_before_sample == min_loss_bbox_vor[inverse_indices])  # 如何理解？
+            
+            fpn_mask = torch.zeros_like(loss_bbox_vor_before_sample, dtype=torch.bool)
+    
+            # 遍历每个分组取第一个True‌:ml-citation{ref="6,8" data="citationList"}
+            for group_id in range(len(unique_bid_with_view)):
+                group_mask = (inverse_indices == group_id)
+                candidates = torch.where(fpn_mask_candidate & group_mask)
+                if candidates.numel() > 0:
+                    fpn_mask[candidates] = True
+            
+            # Generate a mask to eliminate bboxes without correspondence
+            ins_bid_with_view = bid.new_zeros(*bid.shape).index_reduce_(
+                0, idx, bid_with_view, 'amin', include_self=False)
+            _, bidx, bcnt = torch.unique(
+                ins_bid_with_view.long(),
+                return_inverse=True,
+                return_counts=True)
+            bmsk = bcnt[bidx] == 2  # bmask为对称学习服务
+
+            ori_mu_all = ins_rbox_targets[:, 0:2]
+            loss_bbox_ovl = ori_mu_all.new_tensor(0)
+            for batch_id in range(len(batch_gt_instances)):
+                batch_mask = pos_bid_targets[:, 0] == batch_id
+                overlap_mask = torch.logical_and(batch_mask, fpn_mask)
+                # Overlap Losses
+                mu = pos_rbox_targets[overlap_mask]
+                sigma = pos_gaus_preds[overlap_mask]
+                # label = pos_labels[overlap_mask]
+                if len(mu) >= 2:
+                    loss_bbox_ovl += self.loss_overlap((mu, sigma.bmm(sigma)))
             
             #  Batched RBox for Edge Loss
             loss_bbox_edg = ori_mu_all.new_tensor(0)
             if self.epoch >= self.edge_loss_start_epoch:
                 batched_rbox = []
                 for batch_id in range(len(batch_gt_instances)):
-                    group_mask = (ins_batch == batch_id) & (ins_bids != 0)
-                    rbox = ins_rbox_preds[group_mask]
-                    label = ins_labels[group_mask]
+                    batch_mask = pos_bid_targets[:, 0] == batch_id
+                    edge_mask = torch.logical_and(batch_mask, fpn_mask)
+                    
+                    rbox = pos_rbox_preds[edge_mask]
+                    label = pos_labels[edge_mask]
+                    
                     edge_loss_mask = torch.zeros_like(label, dtype=torch.bool)
                     for c in self.edge_loss_cls:
                         edge_loss_mask = torch.logical_or(edge_loss_mask, label == c)
                     batched_rbox.append(rbox[edge_loss_mask])
                 loss_bbox_edg = self.loss_bbox_edg(batched_rbox, self.edges)
             
+             #  Vor Loss
+            loss_bbox_vor = ori_mu_all.new_tensor(0)
+            loss_bbox_vor = torch.topk(min_loss_bbox_vor, int(np.ceil(len(min_loss_bbox_vor) * 0.95)), largest=False)[0].mean()
+            
             loss_bbox_ovl = loss_bbox_ovl / len(batch_gt_instances)
             loss_bbox_vor = loss_bbox_vor / len(batch_gt_instances)
             loss_bbox_edg = loss_bbox_edg / len(batch_gt_instances)
 
-            pair_gaus_preds = ins_gaus_preds[bmsk].view(-1, 2, 2, 2)
-            pair_labels = ins_labels[bmsk].view(-1, 2)[:, 0]
+            
+            pair_mask = torch.logical_and(fpn_mask, bmsk)
+            pair_gaus_preds = pos_gaus_preds[bmsk].view(-1, 2, 2, 2)
+            pair_labels = pos_labels[bmsk].view(-1, 2)[:, 0]
+           
             square_mask = torch.zeros_like(pair_labels, dtype=torch.bool)
             for c in self.square_cls:
                 square_mask = torch.logical_or(square_mask, pair_labels == c)
             
-            pair_cls_scores = torch.empty(
-                *bid.shape, device=bid.device).index_reduce_(
-                    0, idx, pos_cls_scores, 'mean',
-                    include_self=False)[bmsk].view(-1, 2)
+            pair_cls_scores = pos_cls_scores[pair_mask].view(-1, 2)
             
-            pair_angle_preds = torch.empty(
-                *bid.shape, pos_angle_preds.shape[-1],
-                device=bid.device).index_reduce_(
-                    0, idx, pos_angle_preds, 'mean',
-                    include_self=False)[bmsk].view(-1, 2,
-                                                pos_angle_preds.shape[-1])
-            pair_angle_preds = self.angle_coder.decode(
-                    pair_angle_preds, keepdim=True)
+            pair_angle_preds = pos_angle_preds[pair_mask].view(-1, 2, pos_angle_preds.shape[-1])
+            pair_angle_preds = self.angle_coder.decode(pair_angle_preds, keepdim=True)
                                    
             # Self-supervision
             ss_info = batch_img_metas[0]['ss']
@@ -536,8 +537,7 @@ class Point2RBoxV2Head(AnchorFreeHead):
         """Compute regression and classification targets for a single image."""
         num_points = points.size(0)
         num_gts = len(gt_instances)
-        gt_bboxes_forloss = gt_instances.bboxes  # 实际用于后续的loss
-        gt_bboxes_forlabelassign = gt_instances.allgt_bboxes  # 仅用作label-assign
+        gt_bboxes = gt_instances.bboxes
         gt_labels = gt_instances.labels
         gt_bids = gt_instances.bids
 
@@ -545,11 +545,9 @@ class Point2RBoxV2Head(AnchorFreeHead):
             return gt_labels.new_full((num_points,), self.num_classes), \
                    gt_bboxes.new_zeros((num_points, 4)), \
                    gt_bids.new_zeros((num_points, 4))
-            # 感觉这个地方应该为5才是啊
-        areas = gt_bboxes_forlabelassign.areas
-        
-        gt_bboxes_forloss = gt_bboxes_forloss.tensor
-        gt_bboxes_forlabelassign = gt_bboxes_forlabelassign.tensor
+
+        areas = gt_bboxes.areas
+        gt_bboxes = gt_bboxes.tensor
 
         # TODO: figure out why these two are different
         # areas = areas[None].expand(num_points, num_gts)
@@ -557,66 +555,44 @@ class Point2RBoxV2Head(AnchorFreeHead):
         regress_ranges = regress_ranges[:, None, :].expand(
             num_points, num_gts, 2)
         points = points[:, None, :].expand(num_points, num_gts, 2)
+        gt_bboxes = gt_bboxes[None].expand(num_points, num_gts, 5)
+        gt_ctr, gt_wh, gt_angle = torch.split(gt_bboxes, [2, 2, 1], dim=2)
         
-        gt_bboxes_forlabelassign = gt_bboxes_forlabelassign[None].expand(num_points, num_gts, 5)
-        gt_bboxes_forloss = gt_bboxes_forloss[None].expand(num_points, num_gts, 5)
-        
-        gt_ctr_forlabelassign, wh_forlabelassign, gt_angle_forlabelassign = torch.split(gt_bboxes_forlabelassign, [2, 2, 1], dim=2)
-        gt_ctr_forloss, wh_forloss, gt_angle_forloss = torch.split(gt_bboxes_forloss, [2, 2, 1], dim=2)
-        
-        cos_angle, sin_angle = torch.cos(gt_angle_forlabelassign), torch.sin(gt_angle_forlabelassign)
-        rot_matrix = torch.cat([cos_angle, sin_angle, -sin_angle, cos_angle],
-                               dim=-1).reshape(num_points, num_gts, 2, 2)
-        
-        offset_forlabelassign = points - gt_ctr_forlabelassign
-        offset_forlabelassign = torch.matmul(rot_matrix, offset_forlabelassign[..., None])
-        offset_forlabelassign = offset_forlabelassign.squeeze(-1)
-        
-        offset_forloss = points - gt_ctr_forloss
-        
-        w_forlabelassign, h_forlabelassign = wh_forlabelassign[..., 0].clone(), wh_forlabelassign[..., 1].clone()
-        w_forloss, h_forloss = wh_forloss[..., 0].clone(), wh_forloss[..., 1].clone()
-        
-        ## center_r = torch.clamp((w * h).sqrt() / 64, 1, 5)[..., None]  # 不知道原代码为什么要有这一行
-        offset_x_forloss, offset_y_forloss = offset_forloss[..., 0], offset_forloss[..., 1]
-        left_forloss = w_forloss / 2 + offset_x_forloss
-        right_forloss = w_forloss / 2 - offset_x_forloss
-        top_forloss = h_forloss / 2 + offset_y_forloss
-        bottom_forloss = h_forloss / 2 - offset_y_forloss  # points距离gt左边，上边，右边，下边的距离（可能出现负，如果出现负，则为非positivate anchor point）
-        bbox_targets_forloss = torch.stack((left_forloss, top_forloss, right_forloss, bottom_forloss), -1)
-        
-        offset_x_forlabelassign, offset_y_forlabelassign = offset_forlabelassign[..., 0], offset_forlabelassign[..., 1]
-        left_forlabelassign = w_forlabelassign / 2 + offset_x_forlabelassign
-        right_forlabelassign = w_forlabelassign / 2 - offset_x_forlabelassign
-        top_forlabelassign = h_forlabelassign / 2 + offset_y_forlabelassign
-        bottom_forlabelassign = h_forlabelassign / 2 - offset_y_forlabelassign  # points距离gt左边，上边，右边，下边的距离（可能出现负，如果出现负，则为非positivate anchor point）
-        bbox_targets_forlabelassign = torch.stack((left_forlabelassign, top_forlabelassign, right_forlabelassign, bottom_forlabelassign), -1)
+        offset = points - gt_ctr
+        w, h = gt_wh[..., 0].clone(), gt_wh[..., 1].clone()
+
+        # center_r = torch.clamp((w * h).sqrt() / 64, 1, 5)[..., None]  # 暂且注释掉吧
+        offset_x, offset_y = offset[..., 0], offset[..., 1]
+        left = w / 2 + offset_x
+        right = w / 2 - offset_x
+        top = h / 2 + offset_y
+        bottom = h / 2 - offset_y
+        bbox_targets = torch.stack((left, top, right, bottom), -1)
 
         # condition1: inside a gt bbox
-        inside_gt_bbox_mask = bbox_targets_forlabelassign.min(-1)[0] > 0  # 不知道源代码为什么将此行代码注释掉了？？？？， 因为size 不可信！理论上还应该有角度的参与，但是这里就跳过了。因为角度也不可信。
+        # inside_gt_bbox_mask = bbox_targets.min(-1)[0] > 0
         if self.center_sampling:
             # condition1: inside a `center bbox`
-            radius = self.center_sample_radius  # 0.75
-            stride = offset_forlabelassign.new_zeros(offset_forlabelassign.shape)
+            radius = self.center_sample_radius
+            stride = offset.new_zeros(offset.shape)
 
             # project the points on current lvl back to the `original` sizes
             lvl_begin = 0
             for lvl_idx, num_points_lvl in enumerate(num_points_per_lvl):
                 lvl_end = lvl_begin + num_points_lvl
-                stride[lvl_begin:lvl_end] = self.strides[lvl_idx] * radius  # 8*0.75, 16*0.75, 32*0.75
+                stride[lvl_begin:lvl_end] = self.strides[lvl_idx] * radius
                 lvl_begin = lvl_end
 
-            inside_center_bbox_mask = (abs(offset_forlabelassign) < stride).all(dim=-1)  # 其实我感觉应该是 stride / 2 ????
-            inside_gt_bbox_mask = torch.logical_and(inside_center_bbox_mask,
-                                                     inside_gt_bbox_mask)
-            #inside_gt_bbox_mask = (abs(offset) < stride * center_r).all(dim=-1)  # why center_r ?????
+            # inside_center_bbox_mask = (abs(offset) < stride * center_r).all(dim=-1)
+            # inside_gt_bbox_mask = torch.logical_and(inside_center_bbox_mask,
+            #                                         inside_gt_bbox_mask)
+            inside_gt_bbox_mask = (abs(offset) < stride).all(dim=-1)
 
         # condition2: limit the regression range for each location
-        max_regress_distance = bbox_targets_forlabelassign.max(-1)[0]
+        max_regress_distance = bbox_targets.max(-1)[0]
         inside_regress_range = (
             (max_regress_distance >= regress_ranges[..., 0])
-            & (max_regress_distance <= regress_ranges[..., 1]))  # 这个感觉几乎无限制啊, FCOS是有意义的(-1, 64), (64, 128), (128, 256),
-                                              # (256, 512), (512, INF)
+            & (max_regress_distance <= regress_ranges[..., 1]))
 
         # if there are still more than one objects for a location,
         # we choose the one with minimal area
@@ -626,8 +602,8 @@ class Point2RBoxV2Head(AnchorFreeHead):
 
         labels = gt_labels[min_area_inds]
         labels[min_area == INF] = self.num_classes  # set as BG
-        bbox_targets = bbox_targets_forloss[range(num_points), min_area_inds]
-        angle_targets = gt_angle_forloss[range(num_points), min_area_inds]
+        bbox_targets = bbox_targets[range(num_points), min_area_inds]
+        angle_targets = gt_angle[range(num_points), min_area_inds]
         bid_targets = gt_bids[min_area_inds]
         bbox_targets = torch.cat((bbox_targets, angle_targets), -1)
 

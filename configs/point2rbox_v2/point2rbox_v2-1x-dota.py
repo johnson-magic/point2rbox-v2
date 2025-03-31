@@ -85,7 +85,7 @@ train_pipeline = [
     dict(type='mmdet.LoadImageFromFile', backend_args={{_base_.backend_args}}),
     dict(type='mmdet.LoadAnnotations', with_bbox=True, box_type='qbox'),
     dict(type='ConvertBoxType', box_type_mapping=dict(gt_bboxes='rbox')),
-    dict(type='ConvertWeakSupervision', point_proportion=1., hbox_proportion=0, shield=True),
+    dict(type='ConvertWeakSupervision', point_proportion=1., hbox_proportion=0),
     dict(type='mmdet.Resize', scale=(1024, 1024), keep_ratio=True),
     dict(
         type='mmdet.RandomFlip',
