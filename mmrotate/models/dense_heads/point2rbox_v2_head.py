@@ -20,6 +20,8 @@ from mmrotate.registry import MODELS, TASK_UTILS
 from mmrotate.structures import RotatedBoxes, rbox2qbox, hbox2rbox, rbox2hbox
 from mmrotate.models.losses.gaussian_dist_loss import xy_wh_r_2_xy_sigma, gwd_loss
 
+import numpy as np
+
 INF = 1e8
 
 
@@ -59,8 +61,8 @@ class Point2RBoxV2Head(AnchorFreeHead):
     def __init__(self,
                  num_classes: int,
                  in_channels: int,
-                 strides: list = [8],
-                 regress_ranges: list = [(-1, 1e8)],
+                 strides: list = [8, 16, 32],
+                 regress_ranges: list = [(-1, 1e8), (-1, 1e8), (-1, 1e8)],
                  center_sampling: bool = True,
                  center_sample_radius: float = 0.75,
                  angle_version: str = 'le90',
@@ -149,28 +151,32 @@ class Point2RBoxV2Head(AnchorFreeHead):
         self.conv_gate = nn.Conv2d(self.feat_channels, 1, 3, padding=1)
         
     def forward(
-            self, x: Tuple[Tensor]
+            self, feats: Tuple[Tensor]
     ) -> Tuple[List[Tensor], List[Tensor], List[Tensor]]:
         """Forward features from the upstream network.
 
         Args:
             feats (tuple[Tensor]): Features from the upstream network, each is
-                a 4D-tensor.
+                a 4D-tensor, particularly, in point2rboxv2, len(x) == 3.
 
         Returns:
             tuple: A tuple of each level outputs.
 
-            - cls_scores (list[Tensor]): Box scores for each scale level, \
+            - cls_scores (Tensor): Box scores for each scale level, \
             each is a 4D-tensor, the channel number is \
             num_points * num_classes.
-            - bbox_preds (list[Tensor]): Box energies / deltas for each \
+            - bbox_preds (Tensor): Box energies / deltas for each \
             scale level, each is a 4D-tensor, the channel number is \
-            num_points * 4.
-            - centernesses (list[Tensor]): centerness for each scale level, \
-            each is a 4D-tensor, the channel number is num_points * 1.
+            num_points * 4, attention, the stride is already multiplied.
+            - angle_preds (Tensor): Angle encode for each scale level, \
+            each is a 4D-tensor, the channel number is 3, see PSC in \    
+            https://ieeexplore.ieee.org/document/10475581?reason=concurrency.
         """
-        cls_feat = x[0]
-        reg_feat = x[0]
+        return multi_apply(self.single_level_forward, feats, self.strides)
+        
+    def single_level_forward(self, feat: Tensor, stride: int) -> List[Tensor]:
+        cls_feat = feat
+        reg_feat = feat
 
         for cls_layer in self.cls_convs:
             cls_feat = cls_layer(cls_feat)
@@ -186,9 +192,9 @@ class Point2RBoxV2Head(AnchorFreeHead):
         sig_y = bbox_pred[:, 1].exp()
         dx = bbox_pred[:, 2].sigmoid() * 2 - 1  # (-1, 1)
         dy = bbox_pred[:, 3].sigmoid() * 2 - 1  # (-1, 1)
-        bbox_pred = torch.stack((sig_x, sig_y, dx, dy), 1) * 8
+        bbox_pred = torch.stack((sig_x, sig_y, dx, dy), 1) * stride
 
-        return (cls_score,), (bbox_pred,), (angle_pred,)
+        return cls_score, bbox_pred, angle_pred
     
     def loss_by_feat(
         self,
@@ -316,56 +322,20 @@ class Point2RBoxV2Head(AnchorFreeHead):
             pos_rbox_preds = torch.cat((pos_rbox_targets[:, :2], 
                                         pos_bbox_preds[:, :2] * 2,
                                         pos_decoded_angle_preds), -1)
-
-            # Aggregate targets of the same instance based on their identical bid
-            bid_with_view = pos_bid_targets[:, 3] + 0.5 * pos_bid_targets[:, 2]
-            bid, idx = torch.unique(bid_with_view, return_inverse=True)
             
-            # Generate a mask to eliminate bboxes without correspondence
-            ins_bid_with_view = bid.new_zeros(*bid.shape).index_reduce_(
-                0, idx, bid_with_view, 'amin', include_self=False)
-            _, bidx, bcnt = torch.unique(
-                ins_bid_with_view.long(),
-                return_inverse=True,
-                return_counts=True)
-            bmsk = bcnt[bidx] == 2
-
-            # Select instances by batch
-            ins_bids = pos_bid_targets.new_zeros(*bid.shape).index_reduce_(
-                    0, idx, pos_bid_targets[:, 3], 'amin', include_self=False)
             
-            ins_batch = pos_bid_targets.new_zeros(*bid.shape).index_reduce_(
-                    0, idx, pos_bid_targets[:, 0], 'amin', include_self=False)
-            
-            ins_labels = pos_labels.new_zeros(*bid.shape).index_reduce_(
-                    0, idx, pos_labels, 'amin', include_self=False)
-            
-            ins_gaus_preds = pos_gaus_preds.new_zeros(
-                *bid.shape, 4).index_reduce_(
-                    0, idx, pos_gaus_preds.view(-1, 4), 'mean',
-                    include_self=False).view(-1, 2, 2)
-            
-            ins_rbox_preds = pos_rbox_preds.new_zeros(
-                *bid.shape, pos_rbox_preds.shape[-1]).index_reduce_(
-                    0, idx, pos_rbox_preds, 'mean',
-                    include_self=False)
-            
-            ins_rbox_targets = pos_rbox_targets.new_zeros(
-                *bid.shape, pos_rbox_targets.shape[-1]).index_reduce_(
-                    0, idx, pos_rbox_targets, 'mean',
-                    include_self=False)
-
-            ori_mu_all = ins_rbox_targets[:, 0:2]
-            loss_bbox_ovl = ori_mu_all.new_tensor(0)
-            loss_bbox_vor = ori_mu_all.new_tensor(0)
+            mu_batches = pos_rbox_targets[:, 0:2]
+            label_batches = pos_labels
+            sigma_batches = pos_gaus_preds.view(-1, 2, 2)
+            loss_bbox_vor_list = []
             for batch_id in range(len(batch_gt_instances)):
-                group_mask = (ins_batch == batch_id) & (ins_bids != 0)
-                # Overlap and Voronoi Losses
-                mu = ori_mu_all[group_mask]
-                sigma = ins_gaus_preds[group_mask]
-                label = ins_labels[group_mask]
-                if len(mu) >= 2:
-                    loss_bbox_ovl += self.loss_overlap((mu, sigma.bmm(sigma)))
+                group_mask = pos_bid_targets[:, 0] == batch_id
+                mu = mu_batches[group_mask]
+                sigma = sigma_batches[group_mask]
+                label = label_batches[group_mask]
+                
+                # print(mu.shape)
+                # assert len(mu) >= 1  # 实验结束后，可以注释掉该行代码
                 if len(mu) >= 1:
                     pos_thres = [self.voronoi_thres['default'][0]] * self.num_classes
                     neg_thres = [self.voronoi_thres['default'][1]] * self.num_classes
@@ -374,49 +344,92 @@ class Point2RBoxV2Head(AnchorFreeHead):
                             for cls in item[0]:
                                 pos_thres[cls] = item[1][0]
                                 neg_thres[cls] = item[1][1]
-                    loss_bbox_vor += self.loss_voronoi((mu, sigma.bmm(sigma)),
+                    loss_bbox_vor = self.loss_voronoi((mu, sigma.bmm(sigma)),
                                                        label, self.images[batch_id],
                                                        pos_thres, neg_thres,
-                                                       voronoi=self.voronoi_type)
-                    self.vis[batch_id] = self.loss_voronoi.vis
+                                                       voronoi=self.voronoi_type)  # 每个一position都计算Loss, 但并不是每一个position进行反向传播
+                    loss_bbox_vor_list.append(loss_bbox_vor)
+            
+            loss_bbox_vor_before_sample = torch.cat(loss_bbox_vor_list, dim=-1)
+            
+            assert len(loss_bbox_vor_before_sample) == len(pos_bid_targets[:, 0])  # 实验结束后，可以注释掉该行代码
+            bid_with_view = pos_bid_targets[:, 3] + 0.5 * pos_bid_targets[:, 2]
+            unique_bid_with_view, inverse_indices = torch.unique(bid_with_view, return_inverse=True)
+    
+            min_loss_bbox_vor = loss_bbox_vor_before_sample.new_zeros(unique_bid_with_view.shape).index_reduce_(0, inverse_indices, loss_bbox_vor_before_sample, 'amin', include_self=False)  # 
+    
+            
+            with torch.no_grad():  # 关键步骤，基于min_loss_bbox_vor生成fpn_mask(或者说sample方式)以及pair_mask
+                fpn_mask = torch.zeros_like(loss_bbox_vor_before_sample, dtype=torch.bool)
+                fpn_mask_candidate = (loss_bbox_vor_before_sample == min_loss_bbox_vor[inverse_indices])  # 如何理解？ 会涉及到梯度吗？       
+                # 遍历每个分组取第一个True‌:ml-citation{ref="6,8" data="citationList"}
+                for group_id in range(len(unique_bid_with_view)):
+                    group_mask = (inverse_indices == group_id)
+                    candidates = torch.where(fpn_mask_candidate & group_mask)  # return tuple
+                    if candidates[0].numel() > 0:
+                        fpn_mask[candidates[0][0]] = True  # 第一个[0]是tuple取元素，第二个[0]是防止极端情况，loss min出现两个相同值
+            
+                # Generate a mask to eliminate bboxes without correspondence
+                # 获取唯一值和反向索引
+                unique_values, inverse_indices = torch.unique(bid_with_view.long(), return_inverse=True)
+
+                # 计算每个唯一值对应的A中True的总数
+                sum_bid_with_view = torch.zeros_like(unique_values, dtype=torch.long)
+                sum_bid_with_view.scatter_add_(0, inverse_indices, fpn_mask.long())
+
+                # 扩展sum_A到与B同形，并生成条件掩码
+                sum_bid_with_view = sum_bid_with_view[inverse_indices]
+                pair_mask = fpn_mask & (sum_bid_with_view == 2)
+
+
+            loss_bbox_ovl = mu_batches.new_tensor(0)
+            for batch_id in range(len(batch_gt_instances)):
+                batch_mask = pos_bid_targets[:, 0] == batch_id
+                overlap_mask = torch.logical_and(batch_mask, fpn_mask)
+                # Overlap Losses
+                mu = pos_rbox_targets[overlap_mask, 0:2]
+                sigma = pos_gaus_preds[overlap_mask].view(-1, 2, 2)
+                if len(mu) >= 2:
+                    loss_bbox_ovl += self.loss_overlap((mu, sigma.bmm(sigma)))
             
             #  Batched RBox for Edge Loss
-            loss_bbox_edg = ori_mu_all.new_tensor(0)
+            loss_bbox_edg = mu_batches.new_tensor(0)
             if self.epoch >= self.edge_loss_start_epoch:
                 batched_rbox = []
                 for batch_id in range(len(batch_gt_instances)):
-                    group_mask = (ins_batch == batch_id) & (ins_bids != 0)
-                    rbox = ins_rbox_preds[group_mask]
-                    label = ins_labels[group_mask]
+                    batch_mask = pos_bid_targets[:, 0] == batch_id
+                    edge_mask = torch.logical_and(batch_mask, fpn_mask)
+                    
+                    rbox = pos_rbox_preds[edge_mask]
+                    label = pos_labels[edge_mask]
+                    
                     edge_loss_mask = torch.zeros_like(label, dtype=torch.bool)
                     for c in self.edge_loss_cls:
                         edge_loss_mask = torch.logical_or(edge_loss_mask, label == c)
                     batched_rbox.append(rbox[edge_loss_mask])
                 loss_bbox_edg = self.loss_bbox_edg(batched_rbox, self.edges)
             
+             #  Vor Loss  #这里是将Vor Loss内部的计算拎出来了
+            loss_bbox_vor = mu_batches.new_tensor(0)
+            loss_bbox_vor = torch.topk(min_loss_bbox_vor, int(np.ceil(len(min_loss_bbox_vor) * 0.95)), largest=False)[0].mean()
+            
             loss_bbox_ovl = loss_bbox_ovl / len(batch_gt_instances)
             loss_bbox_vor = loss_bbox_vor / len(batch_gt_instances)
             loss_bbox_edg = loss_bbox_edg / len(batch_gt_instances)
 
-            pair_gaus_preds = ins_gaus_preds[bmsk].view(-1, 2, 2, 2)
-            pair_labels = ins_labels[bmsk].view(-1, 2)[:, 0]
+            
+            
+            pair_gaus_preds = pos_gaus_preds[pair_mask].view(-1, 2, 2, 2)
+            pair_labels = pos_labels[pair_mask].view(-1, 2)[:, 0]
+           
             square_mask = torch.zeros_like(pair_labels, dtype=torch.bool)
             for c in self.square_cls:
                 square_mask = torch.logical_or(square_mask, pair_labels == c)
             
-            pair_cls_scores = torch.empty(
-                *bid.shape, device=bid.device).index_reduce_(
-                    0, idx, pos_cls_scores, 'mean',
-                    include_self=False)[bmsk].view(-1, 2)
+            pair_cls_scores = pos_cls_scores[pair_mask].view(-1, 2)
             
-            pair_angle_preds = torch.empty(
-                *bid.shape, pos_angle_preds.shape[-1],
-                device=bid.device).index_reduce_(
-                    0, idx, pos_angle_preds, 'mean',
-                    include_self=False)[bmsk].view(-1, 2,
-                                                pos_angle_preds.shape[-1])
-            pair_angle_preds = self.angle_coder.decode(
-                    pair_angle_preds, keepdim=True)
+            pair_angle_preds = pos_angle_preds[pair_mask].view(-1, 2, pos_angle_preds.shape[-1])
+            pair_angle_preds = self.angle_coder.decode(pair_angle_preds, keepdim=True)
                                    
             # Self-supervision
             ss_info = batch_img_metas[0]['ss']
@@ -488,7 +501,7 @@ class Point2RBoxV2Head(AnchorFreeHead):
         concat_points = torch.cat(points, dim=0)
 
         # the number of points per img, per lvl
-        num_points = [center.size(0) for center in points]
+        num_points = [center.size(0) for center in points]  # [16384, 4096, 1024]
 
         # get labels and bbox_targets of each image
         labels_list, bbox_targets_list, bid_targets_list = multi_apply(
@@ -556,7 +569,7 @@ class Point2RBoxV2Head(AnchorFreeHead):
         offset = points - gt_ctr
         w, h = gt_wh[..., 0].clone(), gt_wh[..., 1].clone()
 
-        center_r = torch.clamp((w * h).sqrt() / 64, 1, 5)[..., None]
+        # center_r = torch.clamp((w * h).sqrt() / 64, 1, 5)[..., None]  # 暂且注释掉吧
         offset_x, offset_y = offset[..., 0], offset[..., 1]
         left = w / 2 + offset_x
         right = w / 2 - offset_x
@@ -581,7 +594,7 @@ class Point2RBoxV2Head(AnchorFreeHead):
             # inside_center_bbox_mask = (abs(offset) < stride * center_r).all(dim=-1)
             # inside_gt_bbox_mask = torch.logical_and(inside_center_bbox_mask,
             #                                         inside_gt_bbox_mask)
-            inside_gt_bbox_mask = (abs(offset) < stride * center_r).all(dim=-1)
+            inside_gt_bbox_mask = (abs(offset) < stride).all(dim=-1)
 
         # condition2: limit the regression range for each location
         max_regress_distance = bbox_targets.max(-1)[0]
@@ -675,13 +688,14 @@ class Point2RBoxV2Head(AnchorFreeHead):
                   the last dimension 5 arrange as (x, y, w, h, t).
         """
         assert len(cls_scores) == len(bbox_preds)
-        num_levels = len(cls_scores)
-
+        num_levels = len(cls_scores)  # fpn level, particually 3
+        
+        # particually, [(128, 128), (64, 64), (32, 32)]
         featmap_sizes = [cls_scores[i].shape[-2:] for i in range(num_levels)]
         mlvl_priors = self.prior_generator.grid_priors(
             featmap_sizes,
             dtype=cls_scores[0].dtype,
-            device=cls_scores[0].device)
+            device=cls_scores[0].device)  # all based 1024
 
         result_list = []
         for img_id in range(len(batch_data_samples[2])):
@@ -707,15 +721,57 @@ class Point2RBoxV2Head(AnchorFreeHead):
                 cfg=cfg,
                 rescale=rescale,
                 with_nms=with_nms)
-            result_list.append(results)
+            result_list.append(results)  # img_level -> fpn_level -> gt_obj_level
         return result_list
+    
+    def selest_pseudo(self, results_list: List[InstanceData]) -> InstanceData:
+        """Select pseudo among fpn level according cls score.
+        To do: design different experiments to opt.
+        
+        Args:
+            results_list: Pseudo gt among fpn levels.
+        
+        Returns:
+            The Best one according to cls score.
+        """
+        level_num = len(results_list)
+        
+        scores_list = []
+        bboxes_list = []
+        labels_list = []
+        for level_id in range(level_num):
+            scores_list.append(results_list[level_id].scores.unsqueeze(1))
+            bboxes_list.append(results_list[level_id].bboxes.tensor)
+            labels_list.append(results_list[level_id].labels.unsqueeze(1))
+            
+        scores_all = torch.cat(scores_list, dim=1).sigmoid()
+        max_values, max_ids = torch.max(scores_all, dim=1)  # select best among fpn
+        # max_ids = max_ids.squeeze(1)  # 形状(obj_num,) 
+        
+        bboxes_stacked = torch.stack(bboxes_list, dim=0)  # 形状(fpn_level_num, obj_num, 5)
+        labels_stacked = torch.stack(labels_list, dim=0)  # 形状(fpn_level_num, obj_num, 1)
+        
+        row_indices = torch.arange(bboxes_stacked.size(1))  # 形状(obj_num,), 为bboxes和labels共用
+    
+        pseudo_bboxes_selected = bboxes_stacked[max_ids, row_indices, :]  # 关键索引操作 
+        labels_selected = labels_stacked[max_ids, row_indices, :]
+        
+        
+        results = InstanceData()
+        results.bboxes = RotatedBoxes(pseudo_bboxes_selected)  # (obj_gt_num, 5)
+        results.scores = torch.ones_like(scores_all[:, 0])  # (obj_gt_num,)?
+        results.labels = labels_list[0].squeeze(1)  # (obj_gt_num,)?
+        
+        return results
+            
+        
     
     def _predict_by_feat_single_pseudo(self,
                                 cls_score_list: List[Tensor],
                                 bbox_pred_list: List[Tensor],
                                 angle_pred_list: List[Tensor],
                                 mlvl_priors: List[Tensor],
-                                data_sample: dict,
+                                data_sample: tuple,
                                 cfg: ConfigDict,
                                 rescale: bool = False,
                                 with_nms: bool = True) -> InstanceData:
@@ -730,16 +786,13 @@ class Point2RBoxV2Head(AnchorFreeHead):
                 (num_priors * 4, H, W).
             angle_pred_list (list[Tensor]): Box angle for a single scale
                 level with shape (N, num_points * encode_size, H, W).
-            score_factor_list (list[Tensor]): Score factor from all scale
-                levels of a single image, each item has shape
-                (num_priors * 1, H, W).
             mlvl_priors (list[Tensor]): Each element in the list is
                 the priors of a single level in feature pyramid. In all
                 anchor-based methods, it has shape (num_priors, 4). In
                 all anchor-free methods, it has shape (num_priors, 2)
                 when `with_stride=True`, otherwise it still has shape
                 (num_priors, 4).
-            img_meta (dict): Image meta info.
+            data_sample (tuple): batch_gt_instances, _, batch_img_metas.
             cfg (mmengine.Config): Test / postprocessing configuration,
                 if None, test_cfg would be used.
             rescale (bool): If True, return boxes in original image space.
@@ -765,36 +818,43 @@ class Point2RBoxV2Head(AnchorFreeHead):
             scale_factor = img_meta['scale_factor']
         gt_bboxes = gt_instances.bboxes.tensor
         gt_labels = gt_instances.labels
-        gt_pos = (gt_bboxes[:, 0:2] / self.strides[0] * scale_factor[1]).long()
+        
+        results_list = []
+        for level_id in range(len(self.strides)):
+            gt_pos = (gt_bboxes[:, 0:2] / self.strides[level_id] * scale_factor[1]).long()  # 此处注意，会暗含向下取整
+            cls_score, bbox_pred, angle_pred = cls_score_list[level_id], bbox_pred_list[level_id], angle_pred_list[level_id]
+            H, W = cls_score.shape[1:3]  # C, H, W
+            gt_valid_mask = (0 <= gt_pos[:, 0]) & (gt_pos[:, 0] < W) & (0 <= gt_pos[:, 1]) & (gt_pos[:, 1] < H)
+        
+            gt_idx = gt_pos[:, 1] * W + gt_pos[:, 0]
+            gt_idx = gt_idx.clamp(0, cls_score[0].numel() - 1)
+            
+            bbox_pred = bbox_pred.permute(1, 2, 0).reshape(-1, 4)[gt_idx]  # H*W, 4
+            cls_score = cls_score.permute(1, 2, 0).reshape(-1, self.cls_out_channels)[gt_idx]
+            angle_pred = angle_pred.permute(1, 2, 0).reshape(-1, self.angle_coder.encode_size)[gt_idx]
+        
+            decoded_angle = self.angle_coder.decode(angle_pred, keepdim=True)
+            
+            bboxes = torch.cat((gt_bboxes[:, 0:2], bbox_pred[:, :2] * 2, decoded_angle), -1)
 
-        cls_score, bbox_pred, angle_pred = cls_score_list[0], bbox_pred_list[0], angle_pred_list[0]
-        H, W = cls_score.shape[1:3]
+            bboxes[~gt_valid_mask, 2:] = 0
+            bboxes[:, 2:4] = bboxes[:, 2:4] / scale_factor[1]
 
-        gt_valid_mask = (0 <= gt_pos[:, 0]) & (gt_pos[:, 0] < W) & (0 <= gt_pos[:, 1]) & (gt_pos[:, 1] < H)
-        gt_idx = gt_pos[:, 1] * W + gt_pos[:, 0]
-        gt_idx = gt_idx.clamp(0, cls_score[0].numel() - 1)
-        bbox_pred = bbox_pred.permute(1, 2, 0).reshape(-1, 4)[gt_idx]
-        cls_score = cls_score.permute(1, 2, 0).reshape(-1, self.cls_out_channels)[gt_idx]
+            for id in self.post_process.keys():  # {11: 1.2}  roundabout
+                bboxes[gt_labels == id, 2:4] *= self.post_process[id]
+            for id in self.square_cls:  # [1, 9, 11]
+                bboxes[gt_labels == id, -1] = 0
 
-        angle_pred = angle_pred.permute(1, 2, 0).reshape(
-                -1, self.angle_coder.encode_size)[gt_idx]
-        decoded_angle = self.angle_coder.decode(angle_pred, keepdim=True)
-        bboxes = torch.cat((gt_bboxes[:, 0:2], bbox_pred[:, :2] * 2, decoded_angle), -1)
+            results = InstanceData()
+            results.bboxes = RotatedBoxes(bboxes.detach())  # (obj_gt_num, 5)
+            row_indices = torch.arange(cls_score.size(0))
+            results.scores = cls_score[row_indices, gt_labels].detach() 
+            #torch.ones_like(cls_score[:, 0])  # (obj_gt_num, 1) or (obj_gt_num,)?
+            results.labels = gt_labels  # (obj_gt_num, 1) or (obj_gt_num,)?
+            
+            results_list.append(results)
 
-        bboxes[~gt_valid_mask, 2:] = 0
-        bboxes[:, 2:4] = bboxes[:, 2:4] / scale_factor[1]
-
-        for id in self.post_process.keys():
-            bboxes[gt_labels == id, 2:4] *= self.post_process[id]
-        for id in self.square_cls:
-            bboxes[gt_labels == id, -1] = 0
-
-        results = InstanceData()
-        results.bboxes = RotatedBoxes(bboxes.detach())
-        results.scores = torch.ones_like(cls_score[:, 0])
-        results.labels = gt_labels
-
-        return results
+        return self.selest_pseudo(results_list)  # select best one
 
     def _predict_by_feat_single(self,
                                 cls_score_list: List[Tensor],

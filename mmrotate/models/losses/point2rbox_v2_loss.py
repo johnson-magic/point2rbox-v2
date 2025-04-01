@@ -297,7 +297,7 @@ def gaussian_voronoi_watershed_loss(mu, sigma,
     L = torch.diag_embed(L)
     L_target = torch.diag_embed(L_target)
     loss = gwd_sigma_loss(L, L_target.detach(), reduction='none')
-    loss = torch.topk(loss, int(np.ceil(len(loss) * topk)), largest=False)[0].mean()
+    # loss = torch.topk(loss, int(np.ceil(len(loss) * topk)), largest=False)[0].mean(), 在外面统一做
     return loss, (vor, markers)
 
 
