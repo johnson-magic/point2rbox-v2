@@ -20,6 +20,8 @@ from mmrotate.registry import MODELS, TASK_UTILS
 from mmrotate.structures import RotatedBoxes, rbox2qbox, hbox2rbox, rbox2hbox
 from mmrotate.models.losses.gaussian_dist_loss import xy_wh_r_2_xy_sigma, gwd_loss
 
+import numpy as np
+
 INF = 1e8
 
 
@@ -322,7 +324,7 @@ class Point2RBoxV2Head(AnchorFreeHead):
                                         pos_decoded_angle_preds), -1)
             
             
-            mu_batches = pos_rbox_targets
+            mu_batches = pos_rbox_targets[:, 0:2]
             label_batches = pos_labels
             sigma_batches = pos_gaus_preds
             loss_bbox_vor_list = []
@@ -349,43 +351,44 @@ class Point2RBoxV2Head(AnchorFreeHead):
             bid_with_view = pos_bid_targets[:, 3] + 0.5 * pos_bid_targets[:, 2]
             unique_bid_with_view, inverse_indices = torch.unique(bid_with_view, return_inverse=True)
     
-            min_loss_bbox_vor = loss_bbox_vor_before_sample.new_zeros(unique_bid_with_view.shape).index_reduce_(0, loss_bbox_vor_before_sample, A, 'amin', include_self=False)  # 
+            min_loss_bbox_vor = loss_bbox_vor_before_sample.new_zeros(unique_bid_with_view.shape).index_reduce_(0, inverse_indices, loss_bbox_vor_before_sample, 'amin', include_self=False)  # 
     
-            # 生成候选掩码‌:ml-citation{ref="4,7" data="citationList"}
-            fpn_mask_candidate = (loss_bbox_vor_before_sample == min_loss_bbox_vor[inverse_indices])  # 如何理解？
             
-            fpn_mask = torch.zeros_like(loss_bbox_vor_before_sample, dtype=torch.bool)
-    
-            # 遍历每个分组取第一个True‌:ml-citation{ref="6,8" data="citationList"}
-            for group_id in range(len(unique_bid_with_view)):
-                group_mask = (inverse_indices == group_id)
-                candidates = torch.where(fpn_mask_candidate & group_mask)
-                if candidates.numel() > 0:
-                    fpn_mask[candidates] = True
+            with torch.no_grad():
+                fpn_mask = torch.zeros_like(loss_bbox_vor_before_sample, dtype=torch.bool)
+                fpn_mask_candidate = (loss_bbox_vor_before_sample == min_loss_bbox_vor[inverse_indices])  # 如何理解？ 会涉及到梯度吗？       
+                # 遍历每个分组取第一个True‌:ml-citation{ref="6,8" data="citationList"}
+                for group_id in range(len(unique_bid_with_view)):
+                    group_mask = (inverse_indices == group_id)
+                    candidates = torch.where(fpn_mask_candidate & group_mask)  # return tuple
+                    if candidates[0].numel() > 0:
+                        fpn_mask[candidates[0][0]] = True  # 第一个[0]是tuple取元素，第二个[0]是防止极端情况，loss min出现两个相同值
             
-            # Generate a mask to eliminate bboxes without correspondence
-            ins_bid_with_view = bid.new_zeros(*bid.shape).index_reduce_(
-                0, idx, bid_with_view, 'amin', include_self=False)
-            _, bidx, bcnt = torch.unique(
-                ins_bid_with_view.long(),
-                return_inverse=True,
-                return_counts=True)
-            bmsk = bcnt[bidx] == 2  # bmask为对称学习服务
+                # Generate a mask to eliminate bboxes without correspondence
+                # 获取唯一值和反向索引
+                unique_values, inverse_indices = torch.unique(bid_with_view.long(), return_inverse=True)
 
-            ori_mu_all = ins_rbox_targets[:, 0:2]
-            loss_bbox_ovl = ori_mu_all.new_tensor(0)
+                # 计算每个唯一值对应的A中True的总数
+                sum_bid_with_view = torch.zeros_like(unique_values, dtype=torch.long)
+                sum_bid_with_view.scatter_add_(0, inverse_indices, fpn_mask.long())
+
+                # 扩展sum_A到与B同形，并生成条件掩码
+                sum_bid_with_view = sum_bid_with_view[inverse_indices]
+                pair_mask = fpn_mask & (sum_bid_with_view == 2)
+
+
+            loss_bbox_ovl = mu_batches.new_tensor(0)
             for batch_id in range(len(batch_gt_instances)):
                 batch_mask = pos_bid_targets[:, 0] == batch_id
                 overlap_mask = torch.logical_and(batch_mask, fpn_mask)
                 # Overlap Losses
-                mu = pos_rbox_targets[overlap_mask]
+                mu = pos_rbox_targets[overlap_mask, 0:2]
                 sigma = pos_gaus_preds[overlap_mask]
-                # label = pos_labels[overlap_mask]
                 if len(mu) >= 2:
                     loss_bbox_ovl += self.loss_overlap((mu, sigma.bmm(sigma)))
             
             #  Batched RBox for Edge Loss
-            loss_bbox_edg = ori_mu_all.new_tensor(0)
+            loss_bbox_edg = mu_batches.new_tensor(0)
             if self.epoch >= self.edge_loss_start_epoch:
                 batched_rbox = []
                 for batch_id in range(len(batch_gt_instances)):
@@ -401,8 +404,8 @@ class Point2RBoxV2Head(AnchorFreeHead):
                     batched_rbox.append(rbox[edge_loss_mask])
                 loss_bbox_edg = self.loss_bbox_edg(batched_rbox, self.edges)
             
-             #  Vor Loss
-            loss_bbox_vor = ori_mu_all.new_tensor(0)
+             #  Vor Loss  #这里是将Vor Loss内部的计算拎出来了
+            loss_bbox_vor = mu_batches.new_tensor(0)
             loss_bbox_vor = torch.topk(min_loss_bbox_vor, int(np.ceil(len(min_loss_bbox_vor) * 0.95)), largest=False)[0].mean()
             
             loss_bbox_ovl = loss_bbox_ovl / len(batch_gt_instances)
@@ -410,9 +413,9 @@ class Point2RBoxV2Head(AnchorFreeHead):
             loss_bbox_edg = loss_bbox_edg / len(batch_gt_instances)
 
             
-            pair_mask = torch.logical_and(fpn_mask, bmsk)
-            pair_gaus_preds = pos_gaus_preds[bmsk].view(-1, 2, 2, 2)
-            pair_labels = pos_labels[bmsk].view(-1, 2)[:, 0]
+            
+            pair_gaus_preds = pos_gaus_preds[pair_mask].view(-1, 2, 2, 2)
+            pair_labels = pos_labels[pair_mask].view(-1, 2)[:, 0]
            
             square_mask = torch.zeros_like(pair_labels, dtype=torch.bool)
             for c in self.square_cls:
