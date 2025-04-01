@@ -326,13 +326,16 @@ class Point2RBoxV2Head(AnchorFreeHead):
             
             mu_batches = pos_rbox_targets[:, 0:2]
             label_batches = pos_labels
-            sigma_batches = pos_gaus_preds
+            sigma_batches = pos_gaus_preds.view(-1, 2, 2)
             loss_bbox_vor_list = []
             for batch_id in range(len(batch_gt_instances)):
                 group_mask = pos_bid_targets[:, 0] == batch_id
                 mu = mu_batches[group_mask]
                 sigma = sigma_batches[group_mask]
                 label = label_batches[group_mask]
+                
+                # print(mu.shape)
+                # assert len(mu) >= 1  # 实验结束后，可以注释掉该行代码
                 if len(mu) >= 1:
                     pos_thres = [self.voronoi_thres['default'][0]] * self.num_classes
                     neg_thres = [self.voronoi_thres['default'][1]] * self.num_classes
@@ -348,13 +351,15 @@ class Point2RBoxV2Head(AnchorFreeHead):
                     loss_bbox_vor_list.append(loss_bbox_vor)
             
             loss_bbox_vor_before_sample = torch.cat(loss_bbox_vor_list, dim=-1)
+            
+            assert len(loss_bbox_vor_before_sample) == len(pos_bid_targets[:, 0])  # 实验结束后，可以注释掉该行代码
             bid_with_view = pos_bid_targets[:, 3] + 0.5 * pos_bid_targets[:, 2]
             unique_bid_with_view, inverse_indices = torch.unique(bid_with_view, return_inverse=True)
     
             min_loss_bbox_vor = loss_bbox_vor_before_sample.new_zeros(unique_bid_with_view.shape).index_reduce_(0, inverse_indices, loss_bbox_vor_before_sample, 'amin', include_self=False)  # 
     
             
-            with torch.no_grad():
+            with torch.no_grad():  # 关键步骤，基于min_loss_bbox_vor生成fpn_mask(或者说sample方式)以及pair_mask
                 fpn_mask = torch.zeros_like(loss_bbox_vor_before_sample, dtype=torch.bool)
                 fpn_mask_candidate = (loss_bbox_vor_before_sample == min_loss_bbox_vor[inverse_indices])  # 如何理解？ 会涉及到梯度吗？       
                 # 遍历每个分组取第一个True‌:ml-citation{ref="6,8" data="citationList"}
@@ -383,7 +388,7 @@ class Point2RBoxV2Head(AnchorFreeHead):
                 overlap_mask = torch.logical_and(batch_mask, fpn_mask)
                 # Overlap Losses
                 mu = pos_rbox_targets[overlap_mask, 0:2]
-                sigma = pos_gaus_preds[overlap_mask]
+                sigma = pos_gaus_preds[overlap_mask].view(-1, 2, 2)
                 if len(mu) >= 2:
                     loss_bbox_ovl += self.loss_overlap((mu, sigma.bmm(sigma)))
             
