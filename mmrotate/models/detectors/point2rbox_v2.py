@@ -3,7 +3,7 @@ import copy
 import math
 import cv2
 import numpy as np
-from typing import Tuple, Union
+from typing import Tuple, Union, List
 
 import torch
 from torch import Tensor
@@ -22,6 +22,12 @@ from mmrotate.structures.bbox import RotatedBoxes, rbox2hbox, hbox2rbox
 
 from third_parties.ted.ted import TED
 
+def gaussian_2d(xy, mu, sigma, normalize=False):
+    dxy = (xy - mu).unsqueeze(-1)
+    t0 = torch.exp(-0.5 * dxy.permute(0, 2, 1).bmm(torch.linalg.solve(sigma, dxy)))
+    if normalize:
+        t0 = t0 / (2 * np.pi * sigma.det().clamp(1e-7).sqrt())
+    return t0
 
 def get_single_pattern(image, bbox, label, square_cls):
     if bbox[2] < 16 or bbox[3] < 16 or bbox[2] > 512 or bbox[3] > 512:
@@ -215,6 +221,114 @@ class Point2RBoxV2(SingleStageDetector):
                 batch_gt_instances[i].bboxes = RotatedBoxes(crop_gt_bboxes)
 
             return batch_inputs, batch_gt_instances
+    
+    def prepare_dual_stream_inputs(self,
+        single_stream_inputs: Tensor,
+        single_stream_targets: InstanceList,
+        single_stream_metas: List[dict]
+    ) -> Tuple[Tensor, InstanceList, List[dict]]:
+        """Prepare dual stream inputs.
+        
+        Args:
+            single_stream_inputs: Input images of shape (N, C, H, W).
+            single_stream_targets: It usually includes bboxes
+                and labels attributes.
+            single_stream_metas: Meta information of each image, e.g.,
+                image size, scaling factor, etc.
+        
+        Returns:
+            dual_stream_inputs, dual_stream_targets.
+        """
+        H, W = single_stream_inputs.shape[2:4]
+        sel_p = torch.rand(1)
+        if sel_p < self.ss_prob[0]:  # rotate
+            # inputs & targets
+            rot = math.pi * (
+                torch.rand(1).item() *
+                (self.rotate_range[1] - self.rotate_range[0]) + self.rotate_range[0])
+            batch_gt_aug = copy.deepcopy(single_stream_targets)
+            batch_inputs_aug, batch_gt_aug = self.rotate_crop(
+                single_stream_inputs, rot, [H, W], batch_gt_aug, 'reflection')
+            for gt_instances in batch_gt_aug:
+                gt_instances.bids[:, 0] += len(single_stream_targets)
+                gt_instances.bids[:, 2] = 1
+            # metas
+            for img_metas in single_stream_metas:
+                img_metas['ss'] = ('rot', rot)
+        elif sel_p < self.ss_prob[0] + self.ss_prob[1]:  # flip 
+            # inputs
+            batch_inputs_aug = transforms.functional.vflip(single_stream_inputs)
+            # targets
+            batch_gt_aug = copy.deepcopy(single_stream_targets)
+            for gt_instances in batch_gt_aug:
+                gt_instances.bboxes.flip_([H, W], 'vertical')
+                gt_instances.bids[:, 0] += len(single_stream_targets)
+                gt_instances.bids[:, 2] = 1
+            # metas
+            for img_metas in single_stream_metas:
+                img_metas['ss'] = ('flp', 0)
+        else:  # scale
+            # inputs
+            sca = (torch.rand(1).item() *
+                (self.scale_range[1] - self.scale_range[0]) + self.scale_range[0])
+            batch_inputs_aug = transforms.functional.resized_crop(single_stream_inputs,
+                0, 0, int(H / sca), int(W / sca), [H, W])
+            # targets
+            batch_gt_aug = copy.deepcopy(single_stream_targets)
+            for gt_instances in batch_gt_aug:
+                gt_instances.bboxes.rescale_([sca, sca])
+                gt_instances.bids[:, 0] += len(single_stream_targets)
+                gt_instances.bids[:, 2] = 1
+            # metas
+            for img_metas in single_stream_metas:
+                img_metas['ss'] = ('sca', sca)     
+        dual_stream_inputs = torch.cat((single_stream_inputs, batch_inputs_aug))
+        dual_stream_targets = single_stream_targets + batch_gt_aug
+        return dual_stream_inputs, dual_stream_targets
+    
+    def prepare_edges(self):
+        """Prepare edges for edge loss"""
+        with torch.no_grad():
+            mean = self.data_preprocessor.mean
+            std = self.data_preprocessor.std
+            batch_edges = self.ted_model(self.bbox_head.images * std + mean)
+            self.bbox_head.edges = batch_edges[3].clamp(0)
+            # cv2.imwrite('E.png', self.bbox_head.edges[0, 0].cpu().numpy() * 255)
+    
+    def prepare_copy_paste_step1(self):
+        raise NotImplemented
+    
+    def prepare_copy_paste_step2(self, dual_stream_inputs, dual_stream_targets):
+        B, _, H, W = dual_stream_inputs.shape
+        aug_begin_id = int(B / 2)
+        aug_samples_len = int(B / 2)
+        
+        for i in range(aug_samples_len):
+            gt_instances = dual_stream_targets[aug_begin_id + i]
+            patterns = self.copy_paste_cache[i]
+            
+            bboxes_paste = []
+            labels_paste = []
+            for p, b, l in patterns:
+                h, w = p.shape[1:3]
+                ox = np.random.randint(0, W - w)
+                oy = np.random.randint(0, H - h)
+                dual_stream_inputs[aug_begin_id + i, :, oy:oy + h, ox:ox + w] = \
+                    dual_stream_inputs[aug_begin_id + i, :, oy:oy + h, ox:ox + w] \
+                    * (1 - p[(3,)]) + p[:3] * p[(3,)]
+                bboxes_paste.append(b + np.float32((ox, oy, 0, 0, 0)))
+                labels_paste.append(l)
+            bboxes = torch.cat((gt_instances.bboxes.tensor, 
+                                gt_instances.bboxes.tensor.new_tensor(np.float32(bboxes_paste))))
+            labels = torch.cat((gt_instances.labels, 
+                                gt_instances.labels.new_tensor(np.int32(labels_paste))))
+            bids = torch.cat((gt_instances.bids, 
+                              gt_instances.bids.new_tensor((i, 1, 0, 0)).expand(len(labels_paste), -1)))
+            gt_instances = InstanceData()
+            gt_instances.bboxes = RotatedBoxes(bboxes)
+            gt_instances.labels = labels
+            gt_instances.bids = bids
+            dual_stream_targets[aug_begin_id + i] = gt_instances
         
     def loss(self, batch_inputs: Tensor,
              batch_data_samples: SampleList) -> Union[dict, list]:
@@ -230,11 +344,10 @@ class Point2RBoxV2(SingleStageDetector):
         Returns:
             dict: A dictionary of loss components.
         """
-        H, W = batch_inputs.shape[2:4]
         batch_gt_instances, _, batch_img_metas = unpack_gt_instances(batch_data_samples)
 
         # Set bids for original images and gts
-        # bids: long (N, 4) (batch, syn, view, instance)
+        # bids: long (N, 4) (batch_id based 0, syn, view, obj_id based 1)
         offset = 1
         for i, gt_instances in enumerate(batch_gt_instances):
             blen = len(gt_instances.bboxes)
@@ -244,102 +357,43 @@ class Point2RBoxV2(SingleStageDetector):
             gt_instances.bids = bids
             offset += blen
 
-        sel_p = torch.rand(1)
-        if sel_p < self.ss_prob[0]:
-            # Generate rotated images and gts
-            rot = math.pi * (
-                torch.rand(1).item() *
-                (self.rotate_range[1] - self.rotate_range[0]) + self.rotate_range[0])
-            for img_metas in batch_img_metas:
-                img_metas['ss'] = ('rot', rot)
-            # batch_inputs_aug = transforms.functional.rotate(batch_inputs, -rot / math.pi * 180)
-            batch_gt_aug = copy.deepcopy(batch_gt_instances)
-            batch_inputs_aug, batch_gt_aug = self.rotate_crop(
-                batch_inputs, rot, [H, W], batch_gt_aug, 'reflection')
-            for gt_instances in batch_gt_aug:
-                gt_instances.bids[:, 0] += len(batch_gt_instances)
-                gt_instances.bids[:, 2] = 1
-        elif sel_p < self.ss_prob[0] + self.ss_prob[1]:
-            # Generate flipped images and gts
-            for img_metas in batch_img_metas:
-                img_metas['ss'] = ('flp', 0)
-            batch_inputs_aug = transforms.functional.vflip(batch_inputs)
-            batch_gt_aug = copy.deepcopy(batch_gt_instances)
-            for gt_instances in batch_gt_aug:
-                gt_instances.bboxes.flip_([H, W], 'vertical')
-                gt_instances.bids[:, 0] += len(batch_gt_instances)
-                gt_instances.bids[:, 2] = 1
-        else:
-            # Generate scaled images and gts
-            sca = (torch.rand(1).item() *
-                (self.scale_range[1] - self.scale_range[0]) + self.scale_range[0])
-            for img_metas in batch_img_metas:
-                img_metas['ss'] = ('sca', sca)
-            batch_inputs_aug = transforms.functional.resized_crop(batch_inputs, 0, 0, int(H / sca), int(W / sca), [H, W])
-            batch_gt_aug = copy.deepcopy(batch_gt_instances)
-            for gt_instances in batch_gt_aug:
-                gt_instances.bboxes.rescale_([sca, sca])
-                gt_instances.bids[:, 0] += len(batch_gt_instances)
-                gt_instances.bids[:, 2] = 1
-                
-        batch_inputs_all = torch.cat((batch_inputs, batch_inputs_aug))
-        self.bbox_head.images = batch_inputs_all
-        # Edge
+        dual_stream_inputs, dual_stream_targets = self.prepare_dual_stream_inputs(
+            batch_inputs, batch_gt_instances, batch_img_metas)
+        
+        self.bbox_head.images = dual_stream_inputs
+        # Edge prepare
         if self.epoch >= self.bbox_head.edge_loss_start_epoch:
-            with torch.no_grad():
-                mean = self.data_preprocessor.mean
-                std = self.data_preprocessor.std
-                batch_edges = self.ted_model(batch_inputs_all * std + mean)
-                self.bbox_head.edges = batch_edges[3].clamp(0)
-                # cv2.imwrite('E.png', self.bbox_head.edges[0, 0].cpu().numpy() * 255)
-
-        if self.copy_paste_cache and len(batch_gt_aug) == len(self.copy_paste_cache):
-            for i in range(len(batch_gt_aug)):
-                gt_instances, patterns = batch_gt_aug[i], self.copy_paste_cache[i]
-                bboxes_paste = []
-                labels_paste = []
-                for p, b, l in patterns:
-                    h, w = p.shape[1:3]
-                    ox = np.random.randint(0, batch_inputs_aug.shape[-1] - w)
-                    oy = np.random.randint(0, batch_inputs_aug.shape[-2] - h)
-                    batch_inputs_aug[i, :, oy:oy + h, ox:ox + w] = \
-                        batch_inputs_aug[i, :, oy:oy + h, ox:ox + w] * (1 - p[(3,)]) + p[:3] * p[(3,)]
-                    bboxes_paste.append(b + np.float32((ox, oy, 0, 0, 0)))
-                    labels_paste.append(l)
-                bboxes = torch.cat((gt_instances.bboxes.tensor, 
-                                    gt_instances.bboxes.tensor.new_tensor(np.float32(bboxes_paste))))
-                labels = torch.cat((gt_instances.labels, 
-                                    gt_instances.labels.new_tensor(np.int32(labels_paste))))
-                bids = torch.cat((gt_instances.bids, 
-                                  gt_instances.bids.new_tensor((i, 1, 0, 0)).expand(len(labels_paste), -1)))
-                gt_instances = InstanceData()
-                gt_instances.bboxes = RotatedBoxes(bboxes)
-                gt_instances.labels = labels
-                gt_instances.bids = bids
-                batch_gt_aug[i] = gt_instances
-
-        batch_inputs_all = torch.cat((batch_inputs, batch_inputs_aug))
-        batch_data_samples_all = []
-        for gt_instances, img_metas in zip(batch_gt_instances + batch_gt_aug, 
+            self.prepare_edges()
+            
+        # Copy_paste prepare
+        if self.copy_paste_cache:  # and len(batch_gt_aug) == len(self.copy_paste_cache): 这一约束去掉，没问题吧
+            self.prepare_copy_paste_step2(dual_stream_inputs, dual_stream_targets)
+            
+        dual_stream_data_samples = [] # gt & meta
+        for gt_instances, img_metas in zip(dual_stream_targets, 
                                            batch_img_metas + batch_img_metas):
             data_sample = DetDataSample(metainfo=img_metas)
             data_sample.gt_instances = gt_instances
-            batch_data_samples_all.append(data_sample)
+            dual_stream_data_samples.append(data_sample)
         
-        feat = self.extract_feat(batch_inputs_all)
-        results_list = self.bbox_head.predict(feat, batch_data_samples_all)
-        
-        # Update point annotations with predicted rbox
-        for data_sample, results in zip(batch_data_samples_all, results_list):
-            mask = data_sample.gt_instances.bids[:, 1] == 0
+        # Prepare pseudo label
+        ## Setp1
+        feat = self.extract_feat(dual_stream_inputs)
+        # results_list = self.bbox_head.predict(feat, dual_stream_data_samples)    # img_level -> fpn_level -> gt_obj_level
+        results_list = self.generate_pseudo_targets(dual_stream_data_samples)
+        ## 对于results_list, 现在是三重伪标签，能否根据cls_score来选择最大的哪个。
+        ## Step2
+        for data_sample, results in zip(dual_stream_data_samples, results_list):
+            # data_sample.gt_instances.allgt_bboxes = copy.deepcopy(data_sample.gt_instances.bboxes)
+            mask = data_sample.gt_instances.bids[:, 1] == 0  # 非copy-paste的目标的目标，更新为Pseudo-label
             data_sample.gt_instances.bboxes.tensor[mask] = results.bboxes.tensor[mask]
             data_sample.gt_instances.labels[mask] = results.labels[mask]
 
-        losses = self.bbox_head.loss(feat, batch_data_samples_all)
+        losses = self.bbox_head.loss(feat, dual_stream_data_samples)
 
         if self.epoch >= self.copy_paste_start_epoch:
             self.copy_paste_cache = []
-            for images, instances in zip(batch_inputs, results_list):
+            for images, instances in zip(dual_stream_inputs, results_list):
                 self.copy_paste_cache.append(get_copy_paste_cache(images, 
                                                                   instances.bboxes.tensor, 
                                                                   instances.labels, 
@@ -395,3 +449,112 @@ class Point2RBoxV2(SingleStageDetector):
                 cv2.imwrite(f'debug/{img_id}_{i}.png', img)
 
         return losses
+    
+    
+    
+    def generate_pseudo_targets(self, dual_stream_data_samples) -> List:
+        """通过watershed算法来生成伪造的targets, 该伪造的targets用于生成label-assign
+        
+        Args:
+            list:
+                data_sample = DetDataSample(metainfo=img_metas)
+                data_sample.gt_instances = gt_instances
+        
+        Returns:
+            list: results = InstanceData()
+                  results.bboxes = RotatedBoxes(pseudo_bboxes_selected)  # (obj_gt_num, 5)
+                  results.scores = torch.ones_like(scores_all[:, 0])  # (obj_gt_num,)?
+                  results.labels = labels_list[0].squeeze(1)  # (obj_gt_num,)?
+        """
+        results_list = []
+        for i in range(len(dual_stream_data_samples)):
+            data_sample = dual_stream_data_samples[i]  # 用途是提取， cx和cy以及label
+            bboxes = data_sample.gt_instances.bboxes.tensor  # num_gt, 5
+            
+            mu = bboxes[:, :2] # obj_num * 2, cx, cy
+            label = data_sample.gt_instances.labels # obj_num
+            down_sample = 2
+            image = self.bbox_head.images[i]
+            voronoi = 'standard'
+            default_sigma = 4096
+            pos_thres = [0.994, 0.994, 0.999, 0.994, 0.994, 0.994, 0.994, 0.95, 0.95, 0.994, 0.95, 0.999, 0.994, 0.994, 0.95]
+            neg_thres = [0.005, 0.005, 0.6, 0.005, 0.005, 0.005, 0.005, 0.005, 0.005, 0.005, 0.005, 0.6, 0.005, 0.005, 0.005]
+            
+            J = len(mu)
+            if J == 0:
+                results_list.append(InstanceData())
+                continue
+            D = down_sample
+            H, W = image.shape[-2:]
+            h, w = H // D, W // D
+            x = torch.linspace(0, h, h, device=mu.device)
+            y = torch.linspace(0, w, w, device=mu.device)
+            xy = torch.stack(torch.meshgrid(x, y, indexing='xy'), -1)
+            vor = mu.new_zeros(J, h, w)
+            # Get distribution for each instance
+            mm = (mu.detach() / D).round()
+            if voronoi == 'standard':
+                sg = mu.new_tensor((default_sigma, 0, 0, default_sigma)).reshape(2, 2)
+                sg = sg / D ** 2
+                for j, m in enumerate(mm):
+                    vor[j] = gaussian_2d(xy.view(-1, 2), m[None], sg[None]).view(h, w)
+            else:
+                raise NotImplemented
+
+            # val: max prob, vor: belong to which instance, cls: belong to which class
+            val, vor = torch.max(vor, 0)
+            if D > 1:
+                vor = vor[:, None, :, None].expand(-1, D, -1, D).reshape(H, W)
+                val = F.interpolate(
+                    val[None, None], (H, W), mode='bilinear', align_corners=True)[0, 0]
+            cls = label[vor]
+            kernel = val.new_ones((1, 1, 3, 3))
+            kernel[0, 0, 1, 1] = -8
+            ridges = torch.conv2d(vor[None].float(), kernel.float(), padding=1)[0] != 0
+            vor += 1
+            pos_thres = val.new_tensor(pos_thres)
+            neg_thres = val.new_tensor(neg_thres)
+            vor[val < pos_thres[cls]] = 0
+            vor[val < neg_thres[cls]] = J + 1
+            vor[ridges] = J + 1
+
+            cls_bg = torch.where(vor == J + 1, 15, cls)
+            cls_bg = torch.where(vor == 0, -1, cls_bg)
+
+            # PyTorch does not support watershed, use cv2
+            img_uint8 = (image - image.min()) / (image.max() - image.min()) * 255
+            img_uint8 = img_uint8.permute(1, 2, 0).detach().cpu().numpy().astype(np.uint8)
+            img_uint8 = cv2.medianBlur(img_uint8, 3)
+            markers = vor.detach().cpu().numpy().astype(np.int32)
+            markers = vor.new_tensor(cv2.watershed(img_uint8, markers))
+
+            pseudo_info = []
+            for j in range(J):
+                xy = (markers == j + 1).nonzero()[:, (1, 0)].float()
+                if len(xy) == 0:
+                    pseudo_info.append(mu[j][0].item())  # cx
+                    pseudo_info.append(mu[j][1].item())  # cy
+                    pseudo_info.append(0)  # w_half
+                    pseudo_info.append(0)  # h_half
+                    pseudo_info.append(0)  # angle, set 0
+                    continue
+                xy = xy - mu[j]
+
+                obj_w_half = torch.max(torch.abs(xy[:, 0]))
+                obj_h_half = torch.max(torch.abs(xy[:, 1]))
+
+                pseudo_info.append(mu[j][0].item())  # cx
+                pseudo_info.append(mu[j][1].item())  # cy
+                pseudo_info.append(obj_w_half * 2)  # w_half
+                pseudo_info.append(obj_h_half * 2)  # h_half
+                pseudo_info.append(0)  # angle, set 0
+                  
+            results = InstanceData()
+            results.bboxes = RotatedBoxes(torch.tensor(pseudo_info).view(-1, 5), device=mu.device)  # (obj_gt_num, 5)
+            results.scores = torch.ones(J, device=mu.device)  # (obj_gt_num,)?
+            results.labels = label  # (obj_gt_num,)?
+            
+            results_list.append(results)
+            
+        
+        return results_list
