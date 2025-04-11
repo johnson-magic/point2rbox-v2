@@ -22,6 +22,12 @@ from mmrotate.structures.bbox import RotatedBoxes, rbox2hbox, hbox2rbox
 
 from third_parties.ted.ted import TED
 
+def gaussian_2d(xy, mu, sigma, normalize=False):
+    dxy = (xy - mu).unsqueeze(-1)
+    t0 = torch.exp(-0.5 * dxy.permute(0, 2, 1).bmm(torch.linalg.solve(sigma, dxy)))
+    if normalize:
+        t0 = t0 / (2 * np.pi * sigma.det().clamp(1e-7).sqrt())
+    return t0
 
 def get_single_pattern(image, bbox, label, square_cls):
     if bbox[2] < 16 or bbox[3] < 16 or bbox[2] > 512 or bbox[3] > 512:
@@ -373,11 +379,12 @@ class Point2RBoxV2(SingleStageDetector):
         # Prepare pseudo label
         ## Setp1
         feat = self.extract_feat(dual_stream_inputs)
-        results_list = self.bbox_head.predict(feat, dual_stream_data_samples)    # img_level -> fpn_level -> gt_obj_level
+        # results_list = self.bbox_head.predict(feat, dual_stream_data_samples)    # img_level -> fpn_level -> gt_obj_level
+        results_list = self.generate_pseudo_targets(dual_stream_data_samples)
         ## 对于results_list, 现在是三重伪标签，能否根据cls_score来选择最大的哪个。
         ## Step2
         for data_sample, results in zip(dual_stream_data_samples, results_list):
-            data_sample.gt_instances.allgt_bboxes = copy.deepcopy(data_sample.gt_instances.bboxes)
+            # data_sample.gt_instances.allgt_bboxes = copy.deepcopy(data_sample.gt_instances.bboxes)
             mask = data_sample.gt_instances.bids[:, 1] == 0  # 非copy-paste的目标的目标，更新为Pseudo-label
             data_sample.gt_instances.bboxes.tensor[mask] = results.bboxes.tensor[mask]
             data_sample.gt_instances.labels[mask] = results.labels[mask]
@@ -442,3 +449,112 @@ class Point2RBoxV2(SingleStageDetector):
                 cv2.imwrite(f'debug/{img_id}_{i}.png', img)
 
         return losses
+    
+    
+    
+    def generate_pseudo_targets(self, dual_stream_data_samples) -> List:
+        """通过watershed算法来生成伪造的targets, 该伪造的targets用于生成label-assign
+        
+        Args:
+            list:
+                data_sample = DetDataSample(metainfo=img_metas)
+                data_sample.gt_instances = gt_instances
+        
+        Returns:
+            list: results = InstanceData()
+                  results.bboxes = RotatedBoxes(pseudo_bboxes_selected)  # (obj_gt_num, 5)
+                  results.scores = torch.ones_like(scores_all[:, 0])  # (obj_gt_num,)?
+                  results.labels = labels_list[0].squeeze(1)  # (obj_gt_num,)?
+        """
+        results_list = []
+        for i in range(len(dual_stream_data_samples)):
+            data_sample = dual_stream_data_samples[i]  # 用途是提取， cx和cy以及label
+            bboxes = data_sample.gt_instances.bboxes.tensor  # num_gt, 5
+            
+            mu = bboxes[:, :2] # obj_num * 2, cx, cy
+            label = data_sample.gt_instances.labels # obj_num
+            down_sample = 2
+            image = self.bbox_head.images[i]
+            voronoi = 'standard'
+            default_sigma = 4096
+            pos_thres = [0.994, 0.994, 0.999, 0.994, 0.994, 0.994, 0.994, 0.95, 0.95, 0.994, 0.95, 0.999, 0.994, 0.994, 0.95]
+            neg_thres = [0.005, 0.005, 0.6, 0.005, 0.005, 0.005, 0.005, 0.005, 0.005, 0.005, 0.005, 0.6, 0.005, 0.005, 0.005]
+            
+            J = len(mu)
+            if J == 0:
+                results_list.append(InstanceData())
+                continue
+            D = down_sample
+            H, W = image.shape[-2:]
+            h, w = H // D, W // D
+            x = torch.linspace(0, h, h, device=mu.device)
+            y = torch.linspace(0, w, w, device=mu.device)
+            xy = torch.stack(torch.meshgrid(x, y, indexing='xy'), -1)
+            vor = mu.new_zeros(J, h, w)
+            # Get distribution for each instance
+            mm = (mu.detach() / D).round()
+            if voronoi == 'standard':
+                sg = mu.new_tensor((default_sigma, 0, 0, default_sigma)).reshape(2, 2)
+                sg = sg / D ** 2
+                for j, m in enumerate(mm):
+                    vor[j] = gaussian_2d(xy.view(-1, 2), m[None], sg[None]).view(h, w)
+            else:
+                raise NotImplemented
+
+            # val: max prob, vor: belong to which instance, cls: belong to which class
+            val, vor = torch.max(vor, 0)
+            if D > 1:
+                vor = vor[:, None, :, None].expand(-1, D, -1, D).reshape(H, W)
+                val = F.interpolate(
+                    val[None, None], (H, W), mode='bilinear', align_corners=True)[0, 0]
+            cls = label[vor]
+            kernel = val.new_ones((1, 1, 3, 3))
+            kernel[0, 0, 1, 1] = -8
+            ridges = torch.conv2d(vor[None].float(), kernel.float(), padding=1)[0] != 0
+            vor += 1
+            pos_thres = val.new_tensor(pos_thres)
+            neg_thres = val.new_tensor(neg_thres)
+            vor[val < pos_thres[cls]] = 0
+            vor[val < neg_thres[cls]] = J + 1
+            vor[ridges] = J + 1
+
+            cls_bg = torch.where(vor == J + 1, 15, cls)
+            cls_bg = torch.where(vor == 0, -1, cls_bg)
+
+            # PyTorch does not support watershed, use cv2
+            img_uint8 = (image - image.min()) / (image.max() - image.min()) * 255
+            img_uint8 = img_uint8.permute(1, 2, 0).detach().cpu().numpy().astype(np.uint8)
+            img_uint8 = cv2.medianBlur(img_uint8, 3)
+            markers = vor.detach().cpu().numpy().astype(np.int32)
+            markers = vor.new_tensor(cv2.watershed(img_uint8, markers))
+
+            pseudo_info = []
+            for j in range(J):
+                xy = (markers == j + 1).nonzero()[:, (1, 0)].float()
+                if len(xy) == 0:
+                    pseudo_info.append(mu[j][0].item())  # cx
+                    pseudo_info.append(mu[j][1].item())  # cy
+                    pseudo_info.append(0)  # w_half
+                    pseudo_info.append(0)  # h_half
+                    pseudo_info.append(0)  # angle, set 0
+                    continue
+                xy = xy - mu[j]
+
+                obj_w_half = torch.max(torch.abs(xy[:, 0]))
+                obj_h_half = torch.max(torch.abs(xy[:, 1]))
+
+                pseudo_info.append(mu[j][0].item())  # cx
+                pseudo_info.append(mu[j][1].item())  # cy
+                pseudo_info.append(obj_w_half * 2)  # w_half
+                pseudo_info.append(obj_h_half * 2)  # h_half
+                pseudo_info.append(0)  # angle, set 0
+                  
+            results = InstanceData()
+            results.bboxes = RotatedBoxes(torch.tensor(pseudo_info).view(-1, 5), device=mu.device)  # (obj_gt_num, 5)
+            results.scores = torch.ones(J, device=mu.device)  # (obj_gt_num,)?
+            results.labels = label  # (obj_gt_num,)?
+            
+            results_list.append(results)
+            
+        
+        return results_list

@@ -537,7 +537,6 @@ class Point2RBoxV2Head(AnchorFreeHead):
         num_points = points.size(0)
         num_gts = len(gt_instances)
         gt_bboxes_forloss = gt_instances.bboxes  # 实际用于后续的loss
-        gt_bboxes_forlabelassign = gt_instances.allgt_bboxes  # 仅用作label-assign
         gt_labels = gt_instances.labels
         gt_bids = gt_instances.bids
 
@@ -546,10 +545,9 @@ class Point2RBoxV2Head(AnchorFreeHead):
                    gt_bboxes.new_zeros((num_points, 4)), \
                    gt_bids.new_zeros((num_points, 4))
             # 感觉这个地方应该为5才是啊
-        areas = gt_bboxes_forlabelassign.areas
+        areas = gt_bboxes_forloss.areas
         
         gt_bboxes_forloss = gt_bboxes_forloss.tensor
-        gt_bboxes_forlabelassign = gt_bboxes_forlabelassign.tensor
 
         # TODO: figure out why these two are different
         # areas = areas[None].expand(num_points, num_gts)
@@ -558,23 +556,18 @@ class Point2RBoxV2Head(AnchorFreeHead):
             num_points, num_gts, 2)
         points = points[:, None, :].expand(num_points, num_gts, 2)
         
-        gt_bboxes_forlabelassign = gt_bboxes_forlabelassign[None].expand(num_points, num_gts, 5)
         gt_bboxes_forloss = gt_bboxes_forloss[None].expand(num_points, num_gts, 5)
         
-        gt_ctr_forlabelassign, wh_forlabelassign, gt_angle_forlabelassign = torch.split(gt_bboxes_forlabelassign, [2, 2, 1], dim=2)
         gt_ctr_forloss, wh_forloss, gt_angle_forloss = torch.split(gt_bboxes_forloss, [2, 2, 1], dim=2)
         
-        cos_angle, sin_angle = torch.cos(gt_angle_forlabelassign), torch.sin(gt_angle_forlabelassign)
+        cos_angle, sin_angle = torch.cos(gt_angle_forloss), torch.sin(gt_angle_forloss)
         rot_matrix = torch.cat([cos_angle, sin_angle, -sin_angle, cos_angle],
                                dim=-1).reshape(num_points, num_gts, 2, 2)
         
-        offset_forlabelassign = points - gt_ctr_forlabelassign
-        offset_forlabelassign = torch.matmul(rot_matrix, offset_forlabelassign[..., None])
-        offset_forlabelassign = offset_forlabelassign.squeeze(-1)
-        
         offset_forloss = points - gt_ctr_forloss
+        offset_forloss = torch.matmul(rot_matrix, offset_forloss[..., None])
+        offset_forloss = offset_forloss.squeeze(-1)
         
-        w_forlabelassign, h_forlabelassign = wh_forlabelassign[..., 0].clone(), wh_forlabelassign[..., 1].clone()
         w_forloss, h_forloss = wh_forloss[..., 0].clone(), wh_forloss[..., 1].clone()
         
         ## center_r = torch.clamp((w * h).sqrt() / 64, 1, 5)[..., None]  # 不知道原代码为什么要有这一行
@@ -584,20 +577,13 @@ class Point2RBoxV2Head(AnchorFreeHead):
         top_forloss = h_forloss / 2 + offset_y_forloss
         bottom_forloss = h_forloss / 2 - offset_y_forloss  # points距离gt左边，上边，右边，下边的距离（可能出现负，如果出现负，则为非positivate anchor point）
         bbox_targets_forloss = torch.stack((left_forloss, top_forloss, right_forloss, bottom_forloss), -1)
-        
-        offset_x_forlabelassign, offset_y_forlabelassign = offset_forlabelassign[..., 0], offset_forlabelassign[..., 1]
-        left_forlabelassign = w_forlabelassign / 2 + offset_x_forlabelassign
-        right_forlabelassign = w_forlabelassign / 2 - offset_x_forlabelassign
-        top_forlabelassign = h_forlabelassign / 2 + offset_y_forlabelassign
-        bottom_forlabelassign = h_forlabelassign / 2 - offset_y_forlabelassign  # points距离gt左边，上边，右边，下边的距离（可能出现负，如果出现负，则为非positivate anchor point）
-        bbox_targets_forlabelassign = torch.stack((left_forlabelassign, top_forlabelassign, right_forlabelassign, bottom_forlabelassign), -1)
 
         # condition1: inside a gt bbox
-        inside_gt_bbox_mask = bbox_targets_forlabelassign.min(-1)[0] > 0  # 不知道源代码为什么将此行代码注释掉了？？？？， 因为size 不可信！理论上还应该有角度的参与，但是这里就跳过了。因为角度也不可信。
+        inside_gt_bbox_mask = bbox_targets_forloss.min(-1)[0] > 0  # 不知道源代码为什么将此行代码注释掉了？？？？， 因为size 不可信！理论上还应该有角度的参与，但是这里就跳过了。因为角度也不可信。
         if self.center_sampling:
             # condition1: inside a `center bbox`
             radius = self.center_sample_radius  # 0.75
-            stride = offset_forlabelassign.new_zeros(offset_forlabelassign.shape)
+            stride = offset_forloss.new_zeros(offset_forloss.shape)
 
             # project the points on current lvl back to the `original` sizes
             lvl_begin = 0
@@ -606,13 +592,13 @@ class Point2RBoxV2Head(AnchorFreeHead):
                 stride[lvl_begin:lvl_end] = self.strides[lvl_idx] * radius  # 8*0.75, 16*0.75, 32*0.75
                 lvl_begin = lvl_end
 
-            inside_center_bbox_mask = (abs(offset_forlabelassign) < stride).all(dim=-1)  # 其实我感觉应该是 stride / 2 ????
+            inside_center_bbox_mask = (abs(offset_forloss) < stride).all(dim=-1)  # 其实我感觉应该是 stride / 2 ????
             inside_gt_bbox_mask = torch.logical_and(inside_center_bbox_mask,
                                                      inside_gt_bbox_mask)
             #inside_gt_bbox_mask = (abs(offset) < stride * center_r).all(dim=-1)  # why center_r ?????
 
         # condition2: limit the regression range for each location
-        max_regress_distance = bbox_targets_forlabelassign.max(-1)[0]
+        max_regress_distance = bbox_targets_forloss.max(-1)[0]
         inside_regress_range = (
             (max_regress_distance >= regress_ranges[..., 0])
             & (max_regress_distance <= regress_ranges[..., 1]))  # 这个感觉几乎无限制啊, FCOS是有意义的(-1, 64), (64, 128), (128, 256),
