@@ -765,7 +765,7 @@ class Point2RBoxV2Head(AnchorFreeHead):
             scale_factor = img_meta['scale_factor']
         gt_bboxes = gt_instances.bboxes.tensor
         gt_labels = gt_instances.labels
-        gt_pos = (gt_bboxes[:, 0:2] / self.strides[0] * scale_factor[1]).long()
+        gt_pos = (gt_bboxes[:, 0:2] / self.strides[0]).long()
 
         cls_score, bbox_pred, angle_pred = cls_score_list[0], bbox_pred_list[0], angle_pred_list[0]
         H, W = cls_score.shape[1:3]
@@ -782,7 +782,7 @@ class Point2RBoxV2Head(AnchorFreeHead):
         bboxes = torch.cat((gt_bboxes[:, 0:2], bbox_pred[:, :2] * 2, decoded_angle), -1)
 
         bboxes[~gt_valid_mask, 2:] = 0
-        bboxes[:, 2:4] = bboxes[:, 2:4] / scale_factor[1]
+        bboxes[:, :4] = bboxes[:, :4] / scale_factor[1]
 
         for id in self.post_process.keys():
             bboxes[gt_labels == id, 2:4] *= self.post_process[id]
